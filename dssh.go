@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -11,8 +12,28 @@ import (
 	"github.com/docker/libtrust"
 )
 
+type CommandHandler func(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) error
+
+func DummyCommandHandler(cmd string, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	switch cmd {
+	case "echo":
+		{
+			fmt.Fprintf(stdout, "%s\n", strings.Join(args, " "))
+		}
+	case "log":
+		{
+			log.Printf("%s\n", strings.Join(args, " "))
+		}
+	default:
+		{
+			return fmt.Errorf("no such command: %s", cmd)
+		}
+	}
+	return nil
+}
+
 func main() {
-	if err := serveSSH(os.Args[1], os.Args[2]); err != nil {
+	if err := serveSSH(os.Args[1], os.Args[2], DummyCommandHandler); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -29,7 +50,7 @@ func generateKeypair() (ssh.Signer, error) {
 	return s, nil
 }
 
-func serveSSH(proto, addr string) error {
+func serveSSH(proto, addr string, h CommandHandler) error {
 	// An SSH server is represented by a ServerConfig, which holds
 	// certificate details and handles authentication of ServerConns.
 	config := &ssh.ServerConfig{
@@ -54,7 +75,7 @@ func serveSSH(proto, addr string) error {
 
 		// Handle new connection
 		go func(conn net.Conn) {
-			err := serveSSHConn(conn, config)
+			err := serveSSHConn(conn, config, h)
 			if err != nil {
 				log.Printf("ssh error: %v\n", err)
 			}
@@ -63,7 +84,7 @@ func serveSSH(proto, addr string) error {
 	return nil
 }
 
-func serveSSHConn(nConn net.Conn, config *ssh.ServerConfig) error {
+func serveSSHConn(nConn net.Conn, config *ssh.ServerConfig, h CommandHandler) error {
 	// Before use, a handshake must be performed on the incoming
 	// net.Conn.
 	_, chans, reqs, err := ssh.NewServerConn(nConn, config)
@@ -96,9 +117,8 @@ func serveSSHConn(nConn net.Conn, config *ssh.ServerConfig) error {
 				switch req.Type {
 				case "exec":
 					{
-						args := strings.Split(string(req.Payload[4:]), " ")
-						fmt.Printf("---> exec |%v|\n", args)
-						if err := handleExec(channel, args); err != nil {
+						if err := handleExec(channel, req, h); err != nil {
+							fmt.Fprintf(channel.Stderr(), "exec: %v\n", err)
 							req.Reply(false, nil)
 						} else {
 							req.Reply(true, nil)
@@ -117,23 +137,10 @@ func serveSSHConn(nConn net.Conn, config *ssh.ServerConfig) error {
 	return nil
 }
 
-func handleExec(channel ssh.Channel, args []string) error {
+func handleExec(channel ssh.Channel, req *ssh.Request, h CommandHandler) (err error) {
+	args := strings.Split(string(req.Payload[4:]), " ")
 	if len(args) == 0 {
-		return fmt.Errorf("exec: no arguments")
+		return fmt.Errorf("no arguments")
 	}
-	switch args[0] {
-	case "echo":
-		{
-			fmt.Fprintf(channel, "%s\n", strings.Join(args[1:], " "))
-		}
-	case "log":
-		{
-			log.Printf("%s\n", strings.Join(args[1:], " "))
-		}
-	default:
-		{
-			fmt.Fprintf(channel.Stderr(), "no such command: %s", args[0])
-		}
-	}
-	return nil
+	return h(args[0], args[1:], channel, channel, channel.Stderr())
 }
